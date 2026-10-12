@@ -1,0 +1,1505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#12284B">
+<title>Campus Navigator</title>
+<style>
+  :root {
+    --sky: #12284B;        /* deep evening blue, page ground */
+    --paving: #FFD23F;     /* tactile-paving yellow, the one bold thing */
+    --paving-press: #E6B92E;
+    --stop: #D9412B;
+    --ink: #FFFFFF;
+    --ink-on-paving: #12284B;
+    --muted: #B7C3D6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--sky);
+    color: var(--ink);
+    /* System font: respects the user's own accessibility text settings */
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header {
+    padding: 16px 20px 8px;
+  }
+  h1 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.01em;
+  }
+  #status {
+    min-height: 5.5rem;
+    padding: 12px 20px 16px;
+    font-size: 1.4rem;
+    line-height: 1.35;
+    font-weight: 500;
+  }
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 0 12px 12px;
+  }
+  .big {
+    flex: 1;
+    width: 100%;
+    border: 0;
+    border-radius: 18px;
+    background: var(--paving);
+    color: var(--ink-on-paving);
+    font: inherit;
+    font-size: clamp(1.6rem, 6vw, 2.2rem);
+    font-weight: 700;
+    line-height: 1.2;
+    padding: 16px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .big:active { background: var(--paving-press); }
+  .big:focus-visible { outline: 4px solid var(--ink); outline-offset: 3px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+  /* Camera preview with detection boxes drawn on top. Visual only: the
+     voice alerts are the accessible channel. Video and canvas both use
+     object-fit: contain with the canvas sized to the video, so boxes line up. */
+  #preview {
+    display: none;
+    position: relative;
+    height: 34vh;
+    margin: 0 12px 12px;
+    border: 2px solid var(--paving);
+    border-radius: 12px;
+    overflow: hidden;
+    background: #000;
+  }
+  #preview.visible { display: block; }
+  #preview video, #preview canvas {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+  }
+  .big.guard-on { background: var(--stop); color: var(--ink); }
+
+  /* Live list of detected objects + estimated distance (visual only;
+     the voice alerts are the accessible channel, so this isn't live-read) */
+  #detections {
+    display: none;
+    padding: 0 20px 12px;
+    font-size: 1.15rem;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+  #detections.visible { display: block; }
+  #detections .inpath { color: var(--paving); font-weight: 700; }
+  #detections .danger { color: #FF8A7A; font-weight: 700; }
+  #status { white-space: pre-line; }
+
+  /* Language choice after a sign is read: 1 Tamil, 2 English, 3 Hindi */
+  #langChoice {
+    display: none;
+    flex: 3;
+    flex-direction: column;
+    gap: 12px;
+  }
+  #langChoice.visible { display: flex; }
+  .big.lang {
+    background: transparent;
+    color: var(--paving);
+    border: 3px solid var(--paving);
+  }
+  .big.lang:active { background: rgba(255, 210, 63, 0.15); }
+</style>
+</head>
+<body>
+
+<header><h1>Campus Navigator</h1></header>
+<div id="status" role="status" aria-live="polite">Tap Proximity alert to begin.</div>
+<div id="detections" aria-hidden="true"></div>
+
+<div id="preview" aria-hidden="true">
+  <video id="guardVideo" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<main>
+  <button class="big" id="btnGuard">Proximity alert</button>
+  <button class="big" id="btnRead">Read &amp; Translate</button>
+  <button class="big" id="btnTrack">Follow track</button>
+  <div id="langChoice" role="group" aria-label="Choose a language">
+    <button class="big lang" data-lang="ta">1 · Tamil (தமிழ்)</button>
+    <button class="big lang" data-lang="en">2 · English</button>
+    <button class="big lang" data-lang="hi">3 · Hindi (हिंदी)</button>
+  </div>
+</main>
+
+<script>
+const rad = d => d * Math.PI / 180;
+
+// ---------------------------------------------------------------
+// VOICE  — text-to-speech with iOS Safari workarounds
+// ---------------------------------------------------------------
+// iOS Safari requires speechSynthesis to be triggered from a user
+// gesture at least once before it will work from timers/callbacks.
+// We warm it up silently on the very first tap anywhere on the page.
+// We also add a 60 ms delay after cancel() because calling
+// cancel()+speak() in the same tick on iOS can silently drop the new
+// utterance, and an onstart resume() guard to unstick iOS when it
+// pauses mid-sentence (a known WebKit bug with long phrases).
+// ---------------------------------------------------------------
+const statusEl = document.getElementById('status');
+let lastSpoken  = null;
+let ttsReady    = false;
+let speakTimer  = null;
+
+function warmUpTTS() {
+  if (ttsReady || !('speechSynthesis' in window)) return;
+  ttsReady = true;
+  const silent = new SpeechSynthesisUtterance('');
+  silent.volume = 0;
+  speechSynthesis.speak(silent);
+}
+// Prime on every user tap so the first real alert never gets blocked
+document.addEventListener('click', warmUpTTS);
+document.addEventListener('touchstart', warmUpTTS, { passive: true });
+
+// Prime the voice list; some browsers fill it in asynchronously
+if ('speechSynthesis' in window) {
+  speechSynthesis.getVoices();
+  speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
+}
+
+// Voice for a language such as 'ta-IN', or null if the phone has none
+function findVoice(lang) {
+  if (!('speechSynthesis' in window)) return null;
+  const want = lang.toLowerCase(), base = want.split('-')[0];
+  const voices = speechSynthesis.getVoices();
+  return voices.find(v => v.lang.toLowerCase().replace('_', '-') === want) ||
+         voices.find(v => v.lang.toLowerCase().startsWith(base)) || null;
+}
+
+// An empty voice list means the browser hasn't reported yet, so just try
+function hasVoice(lang) {
+  if (!('speechSynthesis' in window)) return false;
+  return speechSynthesis.getVoices().length === 0 || !!findVoice(lang);
+}
+
+function makeUtterance(text, lang) {
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang   = lang;
+  // English keeps the phone's default Indian English voice. Tamil / Hindi
+  // pick a matching voice explicitly, as some browsers ignore lang alone.
+  if (lang !== 'en-IN') { const v = findVoice(lang); if (v) u.voice = v; }
+  u.rate   = 0.92;      // slightly slower than default — clearer for a blind user
+  u.pitch  = 1.0;
+  u.volume = 1.0;
+
+  // iOS sometimes pauses mid-sentence; resume() unsticks it
+  u.onstart = () => {
+    setTimeout(() => {
+      try { if (speechSynthesis.paused) speechSynthesis.resume(); } catch (_) {}
+    }, 400);
+  };
+
+  // If the utterance errors (happens on some Android WebViews),
+  // retry once with a shorter text so at least the key word is heard.
+  // Same language and voice as above.
+  u.onerror = (e) => {
+    // cancelled intentionally by a newer alert — ignore
+    if (e.error === 'interrupted' || e.error === 'canceled') return;
+    try {
+      const fallback = new SpeechSynthesisUtterance(text.split('.')[0]);
+      fallback.lang = u.lang;
+      if (u.voice) fallback.voice = u.voice;
+      fallback.rate = u.rate;
+      speechSynthesis.speak(fallback);
+    } catch (_) {}
+  };
+  return u;
+}
+
+// `display` lets the screen show more detail (e.g. the distance in metres)
+// than is spoken aloud. Defaults to the spoken text.
+function speak(text, force = false, display = text) {
+  return speakParts([{ text }], force, display);
+}
+
+// Speaks several pieces back to back, each in its own language (default
+// Indian English), e.g. an English intro and then the Tamil text of a sign.
+// Resolves when the last piece has finished or been cut off.
+function speakParts(parts, force = false, display = parts.map(p => p.text).join(' ')) {
+  const key = parts.map(p => p.text).join(' ');
+  if (!force && key === lastSpoken) return Promise.resolve();
+  lastSpoken = key;
+
+  // Always update the on-screen status text immediately — even if audio
+  // is blocked the sighted user / developer can read what was "said"
+  statusEl.textContent = display;
+
+  if (!('speechSynthesis' in window)) return Promise.resolve();
+
+  // Cancel any current speech, then wait one tick so the cancel
+  // completes before we enqueue the new utterances
+  speechSynthesis.cancel();
+  if (speakTimer) { clearTimeout(speakTimer); speakTimer = null; }
+
+  return new Promise(resolve => {
+    speakTimer = setTimeout(() => {
+      const utterances = parts.map(p => makeUtterance(p.text, p.lang || 'en-IN'));
+      const last = utterances[utterances.length - 1];
+      last.addEventListener('end', resolve);
+      last.addEventListener('error', resolve);
+      // Some Android voices never fire 'end'; don't wait forever
+      setTimeout(resolve, 3000 + key.length * 100);
+      utterances.forEach(u => speechSynthesis.speak(u));
+    }, 60);
+  });
+}
+
+// ---------------------------------------------------------------
+// SCREEN WAKE LOCK — the camera loop stops if the screen sleeps
+// ---------------------------------------------------------------
+let wakeLock = null;
+
+async function keepScreenOn() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }
+  catch (_) {}
+}
+function releaseScreen() {
+  try { wakeLock && wakeLock.release(); } catch (_) {}
+  wakeLock = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && (guardActive || trackActive)) keepScreenOn();
+});
+
+// ---------------------------------------------------------------
+// PROXIMITY GUARD — person, car, bicycle, truck and dog ONLY
+// Uses the rear camera + an in-browser object detector. The detector
+// knows all 80 COCO classes, but everything except the five in
+// TARGET_CLASSES is dropped straight after detection: never tracked,
+// displayed or spoken.
+//
+// Voice rules — only for objects in the forward path (bounding-box
+// centre inside the middle CENTRAL_ZONE of the frame):
+//   distance >  DANGER_DISTANCE_M (2 m): presence only — "Car ahead."
+//   distance <= DANGER_DISTANCE_M      : safety warning + side to step to,
+//                                        from the left/right obstacle analysis
+//     "Car 1.5 metres ahead, coming towards you, move left."
+//        only when frame-to-frame tracking shows the gap closing faster
+//        than the user's own movement (phone motion sensors) can explain;
+//     "Car 1.5 metres ahead, very close to you, move left."
+//        otherwise — user walking/turning, no motion sensors, or not
+//        enough tracking history to be sure the object itself is moving.
+// Every alert is rate-limited (cooldowns below) so it isn't repeated
+// every frame; it repeats sooner only if the situation changes
+// significantly (new object, safer side flips, or it got much closer).
+//
+// Detector note: this runs coco-ssd (a MobileNet-SSD detector trained on
+// the same 80-class COCO dataset YOLO models use), not a literal YOLO
+// network. A real YOLOv8 pass in-browser needs hosting exported model
+// weights plus custom letterbox/NMS decoding that can't be verified
+// without a live camera to test against — a bug there would fail
+// silently for a safety feature. coco-ssd is an officially-published,
+// battle-tested pretrained COCO model that gets the same "which COCO
+// classes are in frame" result reliably. Swap in a real YOLOv8-tfjs
+// export later if you want, once you can test it live.
+//
+// Distance in metres uses the pinhole-camera relation
+//   distance = realObjectHeight x focalLengthPx / boxHeightPx
+// There's no calibrated focal length in a browser, so it's derived from
+// an assumed camera field of view (CAMERA_FOV_LONG_SIDE_DEG). Treat the
+// metres as approximate (roughly +/-30%). To calibrate for your phone:
+// stand a known distance (e.g. 3 m) from a person and adjust the FOV
+// until the on-screen reading matches.
+// ---------------------------------------------------------------
+
+// The only classes the guard reacts to. h / w = typical real height /
+// narrowest real width in metres (w is used only when the box is cut
+// off at the top/bottom of the frame — see estimateDistanceM).
+const TARGET_CLASSES = {
+  person:  { label: 'Person',  h: 1.70, w: 0.50 },
+  car:     { label: 'Car',     h: 1.50, w: 1.80 },
+  bicycle: { label: 'Bicycle', h: 1.05, w: 0.60 },
+  truck:   { label: 'Truck',   h: 3.00, w: 2.40 },
+  dog:     { label: 'Dog',     h: 0.60, w: 0.30 },
+};
+
+const DANGER_DISTANCE_M        = 2.0;   // at or within this -> danger warning
+const DANGER_HYSTERESIS_M      = 0.3;   // must go past 2.3 m to leave danger (stops flicker)
+const CENTRAL_ZONE             = 0.50;  // forward path = middle 50% of frame width
+const CAMERA_FOV_LONG_SIDE_DEG = 65;    // typical phone rear camera; tune per phone
+const DETECT_MIN_SCORE         = 0.5;
+const DETECT_MAX_BOXES         = 20;
+const GUARD_DETECT_INTERVAL_MS = 200;
+
+// Alert frequency
+const DANGER_COOLDOWN_MS       = 4000;  // repeat an unchanged danger warning at most this often
+const DANGER_MIN_GAP_MS        = 1500;  // even a changed warning waits this long after the last one
+const SIGNIFICANT_DIST_DROP_M  = 0.7;   // re-warn early if the object got this much closer
+const SIDE_SWITCH_MARGIN       = 0.25;  // other side must be 25% freer before "move" side flips
+const PRESENCE_COOLDOWN_MS     = 10000; // "Car ahead." at most once per class in this window
+const PRESENCE_QUIET_AFTER_DANGER_MS = 3000; // don't talk over a danger warning
+
+// Tracking across consecutive frames
+const TRACK_MATCH_MIN_IOU      = 0.2;   // box overlap needed to be "the same object"
+const TRACK_MAX_AGE_MS         = 1000;  // drop a track unseen for this long
+const TRACK_WINDOW_MS          = 1500;  // distance history used for closing speed
+const TRACK_MIN_SAMPLES        = 4;
+const TRACK_MIN_SPAN_MS        = 600;
+const DIST_SMOOTHING           = 0.5;   // EMA weight of each new distance measurement
+
+// Deciding whether the OBJECT (not the user) is moving toward the user
+const OBJECT_APPROACH_MIN_MPS  = 0.6;   // closing speed attributable to the object
+const USER_WALK_MAX_MPS        = 1.8;   // brisk walking pace
+const EGO_WINDOW_MS            = 1000;
+const EGO_WALK_ACCEL_RMS       = 0.8;   // m/s^2 linear accel RMS above this -> user walking
+const EGO_TURN_DEG_S           = 25;    // rotation rate above this -> phone turning/panning
+
+const guardVideo = document.getElementById('guardVideo');
+const detectionsEl = document.getElementById('detections');
+let guardActive = false;
+let guardModel = null;
+let guardStream = null;
+let guardTimer = null;
+let guardBusy = false;
+let guardScriptsLoaded = false;
+let tracks = [];
+let lastDangerSpokenAt = 0;
+let lastPresenceAt = {};
+
+const previewEl = document.getElementById('preview');
+const overlayEl = document.getElementById('overlay');
+const overlayCtx = overlayEl.getContext('2d');
+
+// "Calm" alerts (presence, road hazards) leave this gap between each
+// other so one never cuts another off mid-sentence. Danger warnings for
+// people / vehicles within 2 m still interrupt immediately.
+const ALERT_GAP_MS = 2500;
+let lastCalmAlertAt = 0;
+
+// Road hazard state (see ROAD HAZARDS section below)
+let hazardModel = null;
+let hazardIn = null;          // { size, nchw }
+let hazardDets = [];          // latest pass, drawn on the preview
+let hazardDetsAt = 0;
+let hazardHistory = [];       // per pass: Set of hazard keys seen in the forward path
+let lastHazardSpokenAt = {};
+
+function resetGuardHistory() {
+  tracks = [];
+  lastDangerSpokenAt = 0;
+  lastPresenceAt = {};
+  lastCalmAlertAt = 0;
+  hazardDets = [];
+  hazardDetsAt = 0;
+  hazardHistory = [];
+  lastHazardSpokenAt = {};
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureGuardScripts() {
+  if (guardScriptsLoaded) return;
+  await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js');
+  await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
+  guardScriptsLoaded = true;
+}
+
+// TFLite runtime for the road-hazard model (tf.js must load first)
+const TFLITE_CDN = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/';
+let tfliteRuntime = null;
+function ensureTFLiteRuntime() {
+  if (!tfliteRuntime) {
+    tfliteRuntime = (async () => {
+      await loadScript(TFLITE_CDN + 'wasm/tflite_web_api_client.js');
+      await loadScript(TFLITE_CDN + 'dist/tf-tflite.min.js');
+      tflite.setWasmPath(TFLITE_CDN + 'wasm/');
+    })();
+    tfliteRuntime.catch(() => { tfliteRuntime = null; });   // allow a retry next time
+  }
+  return tfliteRuntime;
+}
+
+// First output tensor of a tflite predict() call, whatever shape the result has
+function firstOutput(out) {
+  if (Array.isArray(out)) return out[0];
+  if (out && out.dataSync) return out;
+  return Object.values(out)[0];
+}
+function disposeOutput(out) {
+  if (Array.isArray(out)) out.forEach(t => t.dispose());
+  else if (out && out.dispose) out.dispose();
+  else Object.values(out).forEach(t => t.dispose());
+}
+
+// ---------------------------------------------------------------
+// ROAD HAZARDS — manhole, pothole and speed bump
+// best_3class_hazard_model.tflite is a YOLOv8 detector:
+//   input  [1, 3, 640, 640]  RGB scaled 0-1, letterboxed with grey (114)
+//                            padding, channels-first
+//   output [1, 7, 8400]      per candidate box: cx, cy, w, h, then one
+//                            score per class
+// Class order from training: 0 = Manhole, 1 = Pothole, 2 = SpeedBreaker.
+// A hazard is spoken only when its box overlaps the forward path and it
+// was seen in HAZARD_CONFIRM of the last HAZARD_HISTORY passes, so a single
+// noisy frame never triggers an alert.
+// ---------------------------------------------------------------
+const HAZARD_MODEL_URL   = 'best_3class_hazard_model.tflite';
+const HAZARD_CLASSES = [            // index = model class id; also alert priority
+  { key: 'manhole', label: 'Manhole' },
+  { key: 'pothole', label: 'Pothole' },
+  { key: 'bump',    label: 'Bump' },
+];
+const HAZARD_MIN_SCORE   = 0.45;
+const HAZARD_NMS_IOU     = 0.45;
+const HAZARD_HISTORY     = 3;
+const HAZARD_CONFIRM     = 2;
+const HAZARD_REPEAT_MS   = 8000;    // same hazard spoken at most this often
+const HAZARD_FRESH_MS    = 1500;    // drop boxes from the preview if not refreshed
+
+const hazardCanvas = document.createElement('canvas');
+const hazardCtx = hazardCanvas.getContext('2d', { willReadFrequently: true });
+let hazardInput = null;
+
+async function loadHazardModel() {
+  if (hazardModel) return true;
+  try {
+    await ensureTFLiteRuntime();
+    const m = await tflite.loadTFLiteModel(HAZARD_MODEL_URL);
+    const s = m.inputs[0].shape;                 // [1,3,S,S] or [1,S,S,3]
+    const nchw = s[1] === 3;
+    hazardIn = { nchw, size: nchw ? s[2] : s[1] };
+    hazardModel = m;
+    return true;
+  } catch (e) {
+    console.warn('Hazard model failed to load:', e);
+    hazardModel = null;
+    return false;
+  }
+}
+
+// Returns detections as { key, label, score, bbox: [x, y, w, h] } in video pixels
+async function detectHazards(frameW, frameH) {
+  const S = hazardIn.size;
+  if (hazardCanvas.width !== S) { hazardCanvas.width = S; hazardCanvas.height = S; }
+  // Letterbox: keep the aspect ratio, pad the rest with grey, as YOLOv8 does
+  const r = Math.min(S / frameW, S / frameH);
+  const nw = Math.round(frameW * r), nh = Math.round(frameH * r);
+  const dx = Math.floor((S - nw) / 2), dy = Math.floor((S - nh) / 2);
+  hazardCtx.fillStyle = 'rgb(114,114,114)';
+  hazardCtx.fillRect(0, 0, S, S);
+  hazardCtx.drawImage(guardVideo, dx, dy, nw, nh);
+  const px = hazardCtx.getImageData(0, 0, S, S).data;
+
+  const n = S * S;
+  if (!hazardInput || hazardInput.length !== 3 * n) hazardInput = new Float32Array(3 * n);
+  if (hazardIn.nchw) {
+    for (let i = 0; i < n; i++) {
+      hazardInput[i]       = px[i*4]   / 255;
+      hazardInput[n + i]   = px[i*4+1] / 255;
+      hazardInput[2*n + i] = px[i*4+2] / 255;
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      hazardInput[i*3]   = px[i*4]   / 255;
+      hazardInput[i*3+1] = px[i*4+1] / 255;
+      hazardInput[i*3+2] = px[i*4+2] / 255;
+    }
+  }
+  const x = tf.tensor(hazardInput, hazardIn.nchw ? [1, 3, S, S] : [1, S, S, 3]);
+  const out = hazardModel.predict(x);
+  x.dispose();
+  const t = firstOutput(out);
+  const shape = t.shape, data = await t.data();
+  disposeOutput(out);
+
+  // [1, 4+classes, N] (usual) or [1, N, 4+classes]
+  let C = shape[1], N = shape[2], chFirst = true;
+  if (C > N) { C = shape[2]; N = shape[1]; chFirst = false; }
+  const at = chFirst ? (c, i) => data[c * N + i] : (c, i) => data[i * C + c];
+  const nc = Math.min(C - 4, HAZARD_CLASSES.length);
+
+  const cands = [];
+  let maxCoord = 0;
+  for (let i = 0; i < N; i++) {
+    let best = 0, cls = -1;
+    for (let c = 0; c < nc; c++) {
+      const s = at(4 + c, i);
+      if (s > best) { best = s; cls = c; }
+    }
+    const cx = at(0, i);
+    if (cx > maxCoord) maxCoord = cx;
+    if (best >= HAZARD_MIN_SCORE) cands.push({ cls, score: best, cx, cy: at(1, i), w: at(2, i), h: at(3, i) });
+  }
+  // Some exports give 0-1 coordinates instead of pixels of the 640 input
+  const k = maxCoord <= 2 ? S : 1;
+
+  const boxes = cands.map(c => {
+    let x1 = ((c.cx - c.w / 2) * k - dx) / r, y1 = ((c.cy - c.h / 2) * k - dy) / r;
+    let x2 = ((c.cx + c.w / 2) * k - dx) / r, y2 = ((c.cy + c.h / 2) * k - dy) / r;
+    x1 = Math.max(0, x1); y1 = Math.max(0, y1);
+    x2 = Math.min(frameW, x2); y2 = Math.min(frameH, y2);
+    return { cls: c.cls, score: c.score, bbox: [x1, y1, Math.max(0, x2 - x1), Math.max(0, y2 - y1)] };
+  }).filter(b => b.bbox[2] > 1 && b.bbox[3] > 1);
+
+  // Per-class non-maximum suppression
+  boxes.sort((a, b) => b.score - a.score);
+  const kept = [];
+  for (const b of boxes) {
+    if (kept.every(k2 => k2.cls !== b.cls || iou(k2.bbox, b.bbox) < HAZARD_NMS_IOU)) kept.push(b);
+  }
+  return kept.map(b => ({ ...HAZARD_CLASSES[b.cls], score: b.score, bbox: b.bbox }));
+}
+
+// Box overlaps the forward path (middle CENTRAL_ZONE of the frame width)
+function inForwardPath(bbox, frameW) {
+  const lo = (0.5 - CENTRAL_ZONE / 2) * frameW, hi = (0.5 + CENTRAL_ZONE / 2) * frameW;
+  return bbox[0] < hi && bbox[0] + bbox[2] > lo;
+}
+
+function updateHazardState(dets, frameW, now) {
+  for (const d of dets) d.inPath = inForwardPath(d.bbox, frameW);
+  hazardDets = dets;
+  hazardDetsAt = now;
+  hazardHistory.push(new Set(dets.filter(d => d.inPath).map(d => d.key)));
+  if (hazardHistory.length > HAZARD_HISTORY) hazardHistory.shift();
+}
+
+// "Pothole ahead." etc. Highest-priority confirmed hazard first.
+function maybeSpeakHazard(now) {
+  if (now - lastDangerSpokenAt < PRESENCE_QUIET_AFTER_DANGER_MS) return;
+  if (now - lastCalmAlertAt < ALERT_GAP_MS) return;
+  for (const h of HAZARD_CLASSES) {
+    const seen = hazardHistory.filter(s => s.has(h.key)).length;
+    if (seen < HAZARD_CONFIRM) continue;
+    if (now - (lastHazardSpokenAt[h.key] || 0) < HAZARD_REPEAT_MS) continue;
+    speak(`${h.label} ahead.`, true);
+    lastHazardSpokenAt[h.key] = now;
+    lastCalmAlertAt = now;
+    return;
+  }
+}
+
+// ---- Camera preview overlay ------------------------------------
+function drawOverlay(objDets, frameW, frameH, now) {
+  if (overlayEl.width !== frameW || overlayEl.height !== frameH) {
+    overlayEl.width = frameW; overlayEl.height = frameH;
+  }
+  const g = overlayCtx;
+  g.clearRect(0, 0, frameW, frameH);
+  const lw = Math.max(2, Math.round(frameW / 160));
+  const fs = Math.max(12, Math.round(frameW / 26));
+  g.font = `700 ${fs}px sans-serif`;
+  g.textBaseline = 'top';
+
+  const box = (bbox, color, text) => {
+    const [x, y, w, h] = bbox;
+    g.lineWidth = lw; g.strokeStyle = color;
+    g.strokeRect(x, y, w, h);
+    const tw = g.measureText(text).width + 8;
+    const ty = y - fs - 6 >= 0 ? y - fs - 6 : y;
+    g.fillStyle = color; g.fillRect(x, ty, tw, fs + 6);
+    g.fillStyle = '#12284B'; g.fillText(text, x + 4, ty + 3);
+  };
+
+  for (const d of objDets) {
+    box(d.bbox, '#7FD3FF', `${TARGET_CLASSES[d.cls].label} ${Math.round(d.score * 100)}%`);
+  }
+  if (now - hazardDetsAt <= HAZARD_FRESH_MS) {
+    for (const d of hazardDets) {
+      box(d.bbox, d.inPath ? '#FF5A43' : '#FFD23F', `${d.label} ${Math.round(d.score * 100)}%`);
+    }
+  }
+}
+
+// Free-space analysis: how much of the left vs right half of the view is
+// occupied. Each box's area is split by how much of it lies in each half,
+// so an object sitting centre-left counts mostly against the left side.
+// Only the five target classes are passed in.
+function sideObstacleScore(dets, frameWidth) {
+  const mid = frameWidth / 2;
+  let left = 0, right = 0;
+  for (const d of dets) {
+    const [x, , w, h] = d.bbox;
+    left  += Math.max(0, Math.min(x + w, mid) - x) * h;
+    right += Math.max(0, (x + w) - Math.max(x, mid)) * h;
+  }
+  return { left, right };
+}
+
+function chooseSafeSide(left, right) {
+  if (left < right) return 'left';
+  if (right < left) return 'right';
+  return 'either';
+}
+
+// ---- Distance --------------------------------------------------
+function focalLengthPx(frameW, frameH) {
+  // The rated FOV applies across the sensor's long side, whichever way
+  // the phone is held.
+  return (Math.max(frameW, frameH) / 2) / Math.tan(rad(CAMERA_FOV_LONG_SIDE_DEG) / 2);
+}
+
+function estimateDistanceM(cls, bbox, frameW, frameH) {
+  const size = TARGET_CLASSES[cls];
+  const [, y, w, h] = bbox;
+  const f = focalLengthPx(frameW, frameH);
+  let d = size.h * f / Math.max(h, 1);
+  // If the box is cut off by the top/bottom of the frame, the visible
+  // height is shorter than the real object and the estimate reads too
+  // far. Use the width-based estimate too and keep the nearer (safer) one.
+  const edge = 0.02;
+  if (y <= frameH * edge || y + h >= frameH * (1 - edge)) {
+    d = Math.min(d, size.w * f / Math.max(w, 1));
+  }
+  return d;
+}
+
+function fmtMetres(d) {
+  return d < 10 ? String(Number(d.toFixed(1))) : String(Math.round(d));
+}
+
+// ---- Tracking across consecutive frames ------------------------
+function iou(a, b) {
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const union = a[2] * a[3] + b[2] * b[3] - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+// Match this frame's detections to existing tracks (same class, best box
+// overlap). Sets det.track and det.dist (smoothed distance).
+function updateTracks(dets, now) {
+  const free = new Set(tracks);
+  for (const d of [...dets].sort((a, b) => b.score - a.score)) {
+    let best = null, bestIou = TRACK_MATCH_MIN_IOU;
+    for (const t of free) {
+      if (t.cls !== d.cls) continue;
+      const v = iou(t.bbox, d.bbox);
+      if (v > bestIou) { bestIou = v; best = t; }
+    }
+    if (best) {
+      free.delete(best);
+      best.dist += DIST_SMOOTHING * (d.rawDist - best.dist);
+    } else {
+      best = { cls: d.cls, dist: d.rawDist, history: [], inDanger: false,
+               presenceAnnounced: false, lastDangerAt: 0,
+               lastDangerDist: Infinity, lastSide: null };
+      tracks.push(best);
+    }
+    best.bbox = d.bbox;
+    best.lastSeen = now;
+    best.history.push({ t: now, d: d.rawDist });
+    while (best.history.length && best.history[0].t < now - TRACK_WINDOW_MS) best.history.shift();
+    d.track = best;
+    d.dist = best.dist;
+  }
+  tracks = tracks.filter(t => now - t.lastSeen <= TRACK_MAX_AGE_MS);
+}
+
+// Rate the gap is shrinking (m/s, positive = getting closer), from a
+// least-squares fit over the track's recent distance history. null if
+// there isn't enough history to say.
+function closingSpeedMps(track) {
+  const h = track.history;
+  if (h.length < TRACK_MIN_SAMPLES) return null;
+  if (h[h.length - 1].t - h[0].t < TRACK_MIN_SPAN_MS) return null;
+  let mt = 0, md = 0;
+  for (const s of h) { mt += s.t; md += s.d; }
+  mt /= h.length; md /= h.length;
+  let num = 0, den = 0;
+  for (const s of h) { num += (s.t - mt) * (s.d - md); den += (s.t - mt) ** 2; }
+  if (den === 0) return null;
+  return -(num / den) * 1000;
+}
+
+// ---- User / camera motion (ego-motion) -------------------------
+// A shrinking gap could be the object moving OR the user walking toward
+// it. The phone's motion sensors tell us which, so we only claim the
+// object is "coming towards you" when the user's movement can't explain it.
+let egoSamples = [];
+let egoListening = false;
+
+function onDeviceMotion(e) {
+  let mag = null;
+  const a = e.acceleration, ag = e.accelerationIncludingGravity;
+  if (a && a.x != null) mag = Math.hypot(a.x || 0, a.y || 0, a.z || 0);
+  else if (ag && ag.x != null) mag = Math.abs(Math.hypot(ag.x || 0, ag.y || 0, ag.z || 0) - 9.81);
+  if (mag == null) return;
+  const r = e.rotationRate;
+  const rot = r ? Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0) : 0;
+  const now = Date.now();
+  egoSamples.push({ t: now, mag, rot });
+  while (egoSamples.length && egoSamples[0].t < now - EGO_WINDOW_MS) egoSamples.shift();
+}
+
+function startEgoMotion() {
+  if (egoListening) return;
+  const DME = window.DeviceMotionEvent;
+  if (!DME) return;
+  const listen = () => {
+    window.addEventListener('devicemotion', onDeviceMotion);
+    egoListening = true;
+  };
+  if (typeof DME.requestPermission === 'function') {
+    // iOS: must be requested straight from the button tap, before any await
+    DME.requestPermission().then(r => { if (r === 'granted') listen(); }).catch(() => {});
+  } else {
+    listen();
+  }
+}
+
+function stopEgoMotion() {
+  window.removeEventListener('devicemotion', onDeviceMotion);
+  egoListening = false;
+  egoSamples = [];
+}
+
+// 'still' | 'walking' | 'turning' | 'unknown'
+function getEgoMotion() {
+  const n = egoSamples.length;
+  if (n < 10 || Date.now() - egoSamples[n - 1].t > 500) return 'unknown';
+  let sumSq = 0, sumRot = 0;
+  for (const s of egoSamples) { sumSq += s.mag * s.mag; sumRot += s.rot; }
+  if (sumRot / n > EGO_TURN_DEG_S) return 'turning';
+  if (Math.sqrt(sumSq / n) > EGO_WALK_ACCEL_RMS) return 'walking';
+  return 'still';
+}
+
+function isObjectApproaching(track) {
+  const closing = closingSpeedMps(track);
+  if (closing == null) return false;
+  const ego = getEgoMotion();
+  if (ego === 'still')   return closing > OBJECT_APPROACH_MIN_MPS;
+  // Walking: the gap can close by up to walking pace on its own
+  if (ego === 'walking') return closing > USER_WALK_MAX_MPS + OBJECT_APPROACH_MIN_MPS;
+  return false;   // turning / unknown -> can't attribute motion reliably
+}
+
+// ---- Alerts ----------------------------------------------------
+// Spoken aloud, e.g. "Person 1 metre ahead, very close to you, move left."
+function buildDangerAlert(label, dist, side, approaching) {
+  const m = fmtMetres(dist);
+  const unit = m === '1' ? 'metre' : 'metres';
+  const state = approaching ? 'coming towards you' : 'very close to you';
+  const action = side === 'either' ? 'be careful' : `move ${side}`;
+  return `${label} ${m} ${unit} ahead, ${state}, ${action}.`;
+}
+
+function maybeSpeakDanger(det, dets, frameW, now) {
+  const t = det.track;
+  const label = TARGET_CLASSES[det.cls].label;
+
+  const { left, right } = sideObstacleScore(dets, frameW);
+  let side = chooseSafeSide(left, right);
+  // Don't flip-flop left/right when both sides are nearly equally blocked
+  if (t.lastSide && side !== t.lastSide &&
+      Math.abs(left - right) < SIDE_SWITCH_MARGIN * Math.max(left, right)) {
+    side = t.lastSide;
+  }
+
+  const text = buildDangerAlert(label, det.dist, side, isObjectApproaching(t));
+  const changed = t.lastDangerAt === 0 || side !== t.lastSide ||
+                  (t.lastDangerDist - det.dist) >= SIGNIFICANT_DIST_DROP_M;
+  const due = changed ? now - lastDangerSpokenAt >= DANGER_MIN_GAP_MS
+                      : now - t.lastDangerAt >= DANGER_COOLDOWN_MS;
+  if (!due) return;
+
+  speak(text, true);
+  t.lastDangerAt = now;
+  t.lastDangerDist = det.dist;
+  t.lastSide = side;
+  t.presenceAnnounced = true;   // no "Car ahead." straight after a warning
+  lastDangerSpokenAt = now;
+}
+
+function maybeSpeakPresence(dets, now) {
+  if (now - lastDangerSpokenAt < PRESENCE_QUIET_AFTER_DANGER_MS) return;
+  if (now - lastCalmAlertAt < ALERT_GAP_MS) return;
+  const ahead = dets
+    .filter(d => d.inPath && !d.track.inDanger && !d.track.presenceAnnounced)
+    .sort((a, b) => a.dist - b.dist)[0];
+  if (!ahead) return;
+  // Already announced this class recently (e.g. same person re-detected)
+  ahead.track.presenceAnnounced = true;
+  if (now - (lastPresenceAt[ahead.cls] || 0) < PRESENCE_COOLDOWN_MS) return;
+
+  const label = TARGET_CLASSES[ahead.cls].label;
+  speak(`${label} ahead.`, true, `${label} ${fmtMetres(ahead.dist)} metres ahead.`);
+  lastPresenceAt[ahead.cls] = now;
+  lastCalmAlertAt = now;
+}
+
+// On-screen list of every target object in view with its distance
+function renderDetections(dets, now) {
+  detectionsEl.textContent = '';
+  const addRow = (text, cls) => {
+    const row = document.createElement('div');
+    row.textContent = text;
+    if (cls) row.className = cls;
+    detectionsEl.appendChild(row);
+  };
+  const hz = now - hazardDetsAt <= HAZARD_FRESH_MS ? hazardDets : [];
+  for (const h of hz) {
+    const where = h.inPath ? 'ahead' : (h.bbox[0] + h.bbox[2] / 2 < overlayEl.width / 2 ? 'to the left' : 'to the right');
+    addRow(`${h.label} ${where} (${Math.round(h.score * 100)}%)`, h.inPath ? 'danger' : null);
+  }
+  if (dets.length === 0) {
+    if (hz.length === 0) detectionsEl.textContent = 'Nothing detected ahead.';
+    return;
+  }
+  for (const d of [...dets].sort((a, b) => a.dist - b.dist)) {
+    const row = document.createElement('div');
+    const where = d.inPath ? 'ahead' : (d.side === 'left' ? 'to the left' : 'to the right');
+    row.textContent = `${TARGET_CLASSES[d.cls].label} ${fmtMetres(d.dist)} metres ${where}`;
+    if (d.inPath) row.className = d.track.inDanger ? 'danger' : 'inpath';
+    detectionsEl.appendChild(row);
+  }
+}
+
+async function guardTick() {
+  if (!guardActive || !guardModel || guardBusy || guardVideo.readyState < 2) return;
+  const frameW = guardVideo.videoWidth;
+  const frameH = guardVideo.videoHeight;
+  if (!frameW || !frameH) return;
+
+  // Skip this tick if the previous detection is still running
+  guardBusy = true;
+  let predictions = null;
+  try { predictions = await guardModel.detect(guardVideo, DETECT_MAX_BOXES, DETECT_MIN_SCORE); }
+  catch (_) {}
+  // Road hazards run on the same frame; own try/catch so a failure never
+  // breaks the person / vehicle alerts.
+  if (guardActive && hazardModel) {
+    try { updateHazardState(await detectHazards(frameW, frameH), frameW, Date.now()); }
+    catch (e) { console.warn('Hazard detection failed:', e); }
+  }
+  guardBusy = false;
+  if (!guardActive || !predictions) return;
+
+  const now = Date.now();
+  const lo = 0.5 - CENTRAL_ZONE / 2, hi = 0.5 + CENTRAL_ZONE / 2;
+
+  // Keep ONLY person / car / bicycle / truck / dog
+  const dets = predictions
+    .filter(p => Object.prototype.hasOwnProperty.call(TARGET_CLASSES, p.class))
+    .map(p => {
+      const [x, , w] = p.bbox;
+      const cx = (x + w / 2) / frameW;
+      return {
+        cls: p.class, bbox: p.bbox, score: p.score,
+        inPath: cx >= lo && cx <= hi,
+        side: cx < 0.5 ? 'left' : 'right',
+        rawDist: estimateDistanceM(p.class, p.bbox, frameW, frameH),
+      };
+    });
+
+  updateTracks(dets, now);
+  for (const d of dets) {
+    const t = d.track;
+    t.inDanger = d.inPath && (d.dist <= DANGER_DISTANCE_M ||
+                 (t.inDanger && d.dist <= DANGER_DISTANCE_M + DANGER_HYSTERESIS_M));
+    if (!d.inPath) t.presenceAnnounced = false;
+  }
+  renderDetections(dets, now);
+  drawOverlay(dets, frameW, frameH, now);
+
+  // Danger (nearest in-path object within 2 m) always beats everything else;
+  // then road hazards, then "Person ahead." style presence.
+  // Each calm alert respects ALERT_GAP_MS, so at most one speaks per tick.
+  const danger = dets.filter(d => d.track.inDanger).sort((a, b) => a.dist - b.dist)[0];
+  if (danger) maybeSpeakDanger(danger, dets, frameW, now);
+  else {
+    maybeSpeakHazard(now);
+    maybeSpeakPresence(dets, now);
+  }
+}
+
+async function startGuard() {
+  startEgoMotion();   // before any await, so iOS accepts the permission request
+  hideLangChoice();   // only one camera / listening feature at a time
+  if (trackActive) stopTrack(false);
+  try {
+    speak('Starting proximity alert.', true);
+    await ensureGuardScripts();
+    if (!guardModel) guardModel = await cocoSsd.load();
+    // Optional extra: person / vehicle alerts still work if it fails
+    const hazardsOk = await loadHazardModel();
+    guardStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    guardVideo.srcObject = guardStream;
+    previewEl.classList.add('visible');
+    await guardVideo.play();
+    guardActive = true;
+    resetGuardHistory();
+    keepScreenOn();
+    guardTimer = setInterval(guardTick, GUARD_DETECT_INTERVAL_MS);
+    document.getElementById('btnGuard').textContent = 'Proximity alert: On (tap to stop)';
+    document.getElementById('btnGuard').classList.add('guard-on');
+    detectionsEl.classList.add('visible');
+    speak(hazardsOk
+      ? 'Proximity alert is on. Watching for people, cars, bicycles, trucks, dogs, potholes, manholes and bumps ahead of you.'
+      : 'Proximity alert is on. Watching for people, cars, bicycles, trucks and dogs ahead of you. Road hazard detection could not load.', true);
+  } catch (e) {
+    speak('Could not start the camera for proximity alert. Check camera permission.', true);
+    stopGuard(false);
+  }
+}
+
+function stopGuard(announce = true) {
+  guardActive = false;
+  if (guardTimer) { clearInterval(guardTimer); guardTimer = null; }
+  if (guardStream) { guardStream.getTracks().forEach(t => t.stop()); guardStream = null; }
+  stopEgoMotion();
+  resetGuardHistory();
+  releaseScreen();
+  detectionsEl.classList.remove('visible');
+  detectionsEl.textContent = '';
+  document.getElementById('btnGuard').textContent = 'Proximity alert';
+  document.getElementById('btnGuard').classList.remove('guard-on');
+  previewEl.classList.remove('visible');
+  overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  if (announce) speak('Proximity alert stopped.', true);
+}
+
+document.getElementById('btnGuard').addEventListener('click', () => {
+  if (guardActive) stopGuard(true); else startGuard();
+});
+
+// ---------------------------------------------------------------
+// READ & TRANSLATE — point the camera at a signboard and tap once.
+//   1. The sign is read aloud in its own language (Tamil, Hindi or English):
+//        "The sign is in Tamil. It reads: நூலகம், இந்த வழி"
+//   2. The user is asked which language they want, and can say it or tap
+//      one of three buttons: 1 Tamil, 2 English, 3 Hindi.
+//   3. The text is translated and spoken: "In English: Library, this way."
+//
+// OCR uses Tesseract.js, a pretrained engine that runs in the browser.
+// The first use downloads the English, Tamil and Hindi models; after that
+// they are cached. The language is worked out from the script the text is
+// written in: Tamil letters, Devanagari (Hindi) or Latin (English).
+//
+// Translation uses the free MyMemory web service (no key needed), so it
+// needs internet and the sign's text is sent to that service. It allows a
+// limited number of free translations per day.
+//
+// Speaking Tamil or Hindi needs a voice for that language on the phone
+// (Android: Google text-to-speech; iPhone: Settings > Accessibility >
+// Spoken Content > Voices). If there isn't one, the app says so in English.
+//
+// It shares the rear camera with the proximity guard but never runs at
+// the same time: starting one stops the other, so there is only ever a
+// single camera stream and a single thing speaking.
+// ---------------------------------------------------------------
+const OCR_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+const OCR_MIN_CONFIDENCE = 55;   // below this the read is flagged as unclear
+const OCR_SETTLE_MS = 700;       // let the camera focus before capturing
+const OCR_MAX_LINES = 12;        // a signboard; don't read / translate a whole page
+const TRANSLATE_URL = 'https://api.mymemory.translated.net/get';
+const TRANSLATE_MAX_BYTES = 450; // the service accepts up to 500 bytes per request
+
+const LANGS = {
+  ta: { name: 'Tamil',   tts: 'ta-IN' },
+  en: { name: 'English', tts: 'en-IN' },
+  hi: { name: 'Hindi',   tts: 'hi-IN' },
+};
+const LANG_KEYS = { '1': 'ta', '2': 'en', '3': 'hi' };   // number keys, same as the buttons
+
+let ocrScriptLoaded = false;
+let ocrWorker = null;
+let ocrBusy = false;
+let ocrStream = null;
+const ocrVideo = document.createElement('video');
+ocrVideo.playsInline = true;
+ocrVideo.muted = true;
+const ocrCanvas = document.createElement('canvas');
+
+const btnRead = document.getElementById('btnRead');
+const langChoiceEl = document.getElementById('langChoice');
+let lastRead = null;          // { lines, text, lang } of the last sign read
+let awaitingChoice = false;   // question asked, no language picked yet
+let translating = false;
+
+async function ensureOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+  if (!ocrScriptLoaded) {
+    await loadScript(OCR_SCRIPT_URL);
+    ocrScriptLoaded = true;
+  }
+  // Tesseract exposes a global `Tesseract`
+  ocrWorker = await Tesseract.createWorker(['eng', 'tam', 'hin']);
+  return ocrWorker;
+}
+
+function stopOcrCamera() {
+  if (ocrStream) { ocrStream.getTracks().forEach(t => t.stop()); ocrStream = null; }
+  ocrVideo.srcObject = null;
+}
+
+// Which of the three languages the text is in, from the script it uses
+// (Tamil letters, Devanagari for Hindi, or Latin for English).
+// Bilingual signs (e.g. Tamil + English) count as Tamil / Hindi: the
+// English voice can't read Tamil or Hindi letters at all.
+function detectLanguage(text) {
+  const count = re => (text.match(re) || []).length;
+  const ta = count(/[஀-௿]/g);
+  const hi = count(/[ऀ-ॿ]/g);
+  const en = count(/[A-Za-z]/g);
+  if (ta > 0 && ta >= hi && ta >= en * 0.3) return 'ta';
+  if (hi > 0 && hi >= en * 0.3) return 'hi';
+  return 'en';
+}
+
+// A speech part in that language's voice, or an English note if the
+// phone has no voice for it (the text is still shown on screen)
+function inLanguage(text, code) {
+  const L = LANGS[code];
+  if (hasVoice(L.tts)) return { text, lang: L.tts };
+  return { text: `This phone has no ${L.name} voice installed.` };
+}
+
+function showLangChoice() { langChoiceEl.classList.add('visible'); }
+function hideLangChoice() {
+  awaitingChoice = false;
+  stopListening();
+  langChoiceEl.classList.remove('visible');
+}
+
+// ---- Saying the language instead of tapping ---------------------
+// Uses the browser's speech recognition where available (Chrome on
+// Android, Safari on iPhone). Listening starts only after the question
+// has been spoken, so the app doesn't hear itself. The buttons always work.
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognizer = null;
+
+function matchSpokenLanguage(heard) {
+  const s = heard.toLowerCase();
+  if (/tamil|thamizh|tamizh|தமிழ்|\bone\b|\b1\b/.test(s)) return 'ta';
+  if (/english|ஆங்கிலம்|अंग्रेज़ी|अंग्रेजी|\btwo\b|\b2\b/.test(s)) return 'en';
+  if (/hindi|हिंदी|हिन्दी|\bthree\b|\b3\b/.test(s)) return 'hi';
+  return null;
+}
+
+function listenForLanguage() {
+  if (!SpeechRec || !awaitingChoice) return;
+  stopListening();
+  try {
+    const rec = new SpeechRec();
+    rec.lang = 'en-IN';
+    rec.interimResults = false;
+    rec.maxAlternatives = 3;
+    rec.onresult = (e) => {
+      const heard = Array.from(e.results[0]).map(a => a.transcript).join(' ');
+      const code = matchSpokenLanguage(heard);
+      if (code) chooseLanguage(code);
+      else speak('Sorry, I did not catch that. Tap 1 for Tamil, 2 for English, or 3 for Hindi.', true);
+    };
+    rec.onerror = () => {};   // no speech or no microphone permission: the buttons still work
+    rec.onend = () => { if (recognizer === rec) recognizer = null; };
+    recognizer = rec;
+    rec.start();
+  } catch (_) {
+    recognizer = null;
+  }
+}
+
+function stopListening() {
+  if (!recognizer) return;
+  const rec = recognizer;
+  recognizer = null;
+  try { rec.abort(); } catch (_) {}
+}
+
+// ---- Translation -------------------------------------------------
+// Cuts a line down to what the translation service accepts
+function fitBytes(s, max) {
+  const enc = new TextEncoder();
+  while (s && enc.encode(s).length > max) s = s.slice(0, -1);
+  return s;
+}
+
+// The service returns some characters as HTML entities (&#39; etc.)
+function decodeEntities(s) {
+  const t = document.createElement('textarea');
+  t.innerHTML = s;
+  return t.value;
+}
+
+async function translateLine(line, from, to) {
+  const params = new URLSearchParams({ q: fitBytes(line, TRANSLATE_MAX_BYTES), langpair: `${from}|${to}` });
+  const res = await fetch(`${TRANSLATE_URL}?${params}`);
+  if (!res.ok) throw new Error(`Translation HTTP ${res.status}`);
+  const json = await res.json();
+  if (Number(json.responseStatus) !== 200 || !json.responseData) {
+    throw new Error(json.responseDetails || 'Translation failed');
+  }
+  return decodeEntities(json.responseData.translatedText || '');
+}
+
+// Each line of the sign is translated separately, then joined again
+async function translateText(lines, from, to) {
+  const out = await Promise.all(lines.map(l => translateLine(l, from, to)));
+  return out.map(s => s.trim()).filter(Boolean).join('. ');
+}
+
+async function chooseLanguage(code) {
+  if (!lastRead || translating || ocrBusy) return;
+  awaitingChoice = false;
+  stopListening();
+  const target = LANGS[code];
+  translating = true;
+  try {
+    let text = lastRead.text;
+    if (code !== lastRead.lang) {
+      speak(`Translating to ${target.name}.`, true);
+      text = await translateText(lastRead.lines, lastRead.lang, code);
+      if (!text) throw new Error('Empty translation');
+    }
+    // e.g. "In English: Library, this way."
+    speakParts([{ text: `In ${target.name}:` }, inLanguage(text, code)], true,
+               `In ${target.name}: ${text}`);
+  } catch (e) {
+    console.warn('Translation error:', e);
+    speak('Could not translate right now. Check the internet connection and try again.', true);
+  } finally {
+    translating = false;
+  }
+}
+
+// ---- Reading the sign --------------------------------------------
+async function readText() {
+  if (ocrBusy) return;
+  ocrBusy = true;
+  btnRead.textContent = 'Reading…';
+  hideLangChoice();
+  lastRead = null;
+
+  // Only one camera feature at a time
+  if (guardActive) stopGuard(false);
+  if (trackActive) stopTrack(false);
+
+  // Load the OCR engine while the camera opens (first time downloads the models)
+  const workerReady = ensureOcrWorker();
+  workerReady.catch(() => {});   // handled where it's awaited below
+
+  try {
+    speak('Point the camera at the sign.', true);
+
+    // Start the rear camera
+    ocrStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } },
+      audio: false
+    });
+    ocrVideo.srcObject = ocrStream;
+    await ocrVideo.play();
+
+    // Give the camera a moment to focus, then grab a frame
+    await new Promise(r => setTimeout(r, OCR_SETTLE_MS));
+    const w = ocrVideo.videoWidth, h = ocrVideo.videoHeight;
+    if (!w || !h) throw new Error('no-frame');
+    ocrCanvas.width = w; ocrCanvas.height = h;
+    ocrCanvas.getContext('2d').drawImage(ocrVideo, 0, 0, w, h);
+
+    stopOcrCamera();   // done with the camera; free it
+
+    speak('Reading the text. Please wait.', true);
+    const worker = await workerReady;
+    const { data } = await worker.recognize(ocrCanvas);
+
+    // Clean up the recognised text: collapse whitespace, drop junk lines
+    const lines = (data.text || '')
+      .replace(/[^\S\n]+/g, ' ')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length >= 2)
+      .slice(0, OCR_MAX_LINES);
+    const clean = lines.join('. ').trim();
+
+    if (clean.length < 2) {
+      speak('No readable text found. Hold the camera steady and closer to the sign, then try again.', true);
+      return;
+    }
+
+    const lang = detectLanguage(clean);
+    lastRead = { lines, text: clean, lang };
+    const name = LANGS[lang].name;
+    const intro = data.confidence >= OCR_MIN_CONFIDENCE
+      ? `The sign is in ${name}. It reads:`
+      // Low confidence but something was found — read it, but flag it
+      : `The text is not clear. The sign seems to be in ${name}. It may read:`;
+    const question = SpeechRec
+      ? 'Which language do you want? Say or choose: 1 Tamil, 2 English, or 3 Hindi.'
+      : 'Which language do you want? Choose 1 for Tamil, 2 for English, or 3 for Hindi.';
+
+    awaitingChoice = true;
+    showLangChoice();
+    speakParts([{ text: intro }, inLanguage(clean, lang), { text: question }], true,
+               `${intro} ${clean}\n\n${question}`)
+      .then(listenForLanguage);
+  } catch (e) {
+    console.warn('OCR error:', e);
+    if (e && e.name === 'NotAllowedError') {
+      speak('Camera permission is needed to read text.', true);
+    } else {
+      speak('Could not read the text. Please try again.', true);
+    }
+    stopOcrCamera();
+  } finally {
+    ocrBusy = false;
+    btnRead.textContent = 'Read & Translate';
+  }
+}
+
+btnRead.addEventListener('click', readText);
+langChoiceEl.querySelectorAll('button').forEach(b =>
+  b.addEventListener('click', () => chooseLanguage(b.dataset.lang)));
+document.addEventListener('keydown', (e) => {
+  if (!langChoiceEl.classList.contains('visible')) return;
+  const code = LANG_KEYS[e.key];
+  if (code) chooseLanguage(code);
+});
+
+// ---------------------------------------------------------------
+// FOLLOW TRACK — guides the user along yellow tactile paving.
+// Finds bright-yellow pixels by colour (no model, works offline) in the
+// lower part of the camera image, i.e. the ground just ahead. That area
+// is split into a near band (bottom) and a far band (above it):
+//   near band — where the track is now:   straight / move left / move right
+//   far band  — where it is heading:      bends left / bends right / ends ahead
+// Spoken: "Track detected. Go straight along the track."
+//         "Track on your left, move left."  ...  "Track ended."
+// A message is spoken only after TRACK_CONFIRM frames in a row agree, and
+// repeated at most every TRACK_REPEAT_MS, so it doesn't chatter.
+// Colour only: other yellow things on the ground (road paint, leaves, a
+// yellow vehicle low in the frame) can be mistaken for the track, and it
+// can't tell line (guide) tiles from dot (stop / warning) tiles.
+//
+// Uses the same camera preview as the proximity guard but never runs at
+// the same time as it or Read & Translate.
+// ---------------------------------------------------------------
+const TRACK_INTERVAL_MS  = 250;
+const TRACK_SAMPLE_W     = 160;    // analyse a small copy of the frame (fast)
+const TRACK_GROUND_FROM  = 0.4;    // ground = bottom 60% of the frame
+const TRACK_MIN_FRACTION = 0.03;   // 3% of a band yellow = track is there
+const TRACK_CENTRE_TOL   = 0.15;   // within ±15% of the width from centre = straight ahead
+const TRACK_BEND_MIN     = 0.15;   // far band this far sideways from the near band = bend
+const TRACK_CONFIRM      = 3;      // frames in a row before a message is spoken
+const TRACK_LOST_FRAMES  = 6;      // about 1.5 s with no track = "Track ended."
+const TRACK_REPEAT_MS    = 8000;   // same message at most this often
+
+const btnTrack = document.getElementById('btnTrack');
+const trackCanvas = document.createElement('canvas');
+const trackCtx = trackCanvas.getContext('2d', { willReadFrequently: true });
+const trackMaskCanvas = document.createElement('canvas');
+const trackMaskCtx = trackMaskCanvas.getContext('2d');
+let trackMask = null;
+let trackActive = false;
+let trackStream = null;
+let trackTimer = null;
+let trackOn = false;          // currently on / near a track (announced)
+let trackCandidate = null;    // message seen in the last frames
+let trackCount = 0;           // how many frames in a row
+let trackMissing = 0;         // frames in a row with no track
+let trackSaid = null;
+let trackSaidAt = 0;
+
+function resetTrackState() {
+  trackOn = false;
+  trackCandidate = null;
+  trackCount = 0;
+  trackMissing = 0;
+  trackSaid = null;
+  trackSaidAt = 0;
+}
+
+// Tactile-paving yellow: hue about 38–68°, strongly coloured, not dark
+function isTrackYellow(r, g, b) {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  if (max < 100 || d / max < 0.45 || max === b) return false;
+  const h = max === r ? 60 * (g - b) / d : 60 * (2 + (b - r) / d);
+  return h >= 38 && h <= 68;
+}
+
+// Where the yellow is in the near and far ground bands. x is the centre of
+// the yellow pixels, from -0.5 (left edge) to 0.5 (right edge); null = none.
+function analyseTrack() {
+  const vw = guardVideo.videoWidth, vh = guardVideo.videoHeight;
+  const W = TRACK_SAMPLE_W, H = Math.round(W * vh / vw);
+  if (trackCanvas.width !== W || trackCanvas.height !== H) {
+    trackCanvas.width = trackMaskCanvas.width = W;
+    trackCanvas.height = trackMaskCanvas.height = H;
+    trackMask = trackMaskCtx.createImageData(W, H);
+  }
+  trackCtx.drawImage(guardVideo, 0, 0, W, H);
+  const px = trackCtx.getImageData(0, 0, W, H).data;
+  const m = trackMask.data;
+  m.fill(0);
+
+  const y0 = Math.floor(H * TRACK_GROUND_FROM), yMid = Math.floor((y0 + H) / 2);
+  const far = { n: 0, sx: 0, total: 0 }, near = { n: 0, sx: 0, total: 0 };
+  for (let y = y0; y < H; y++) {
+    const band = y < yMid ? far : near;
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      band.total++;
+      if (isTrackYellow(px[i], px[i + 1], px[i + 2])) {
+        band.n++;
+        band.sx += x;
+        m[i] = 0; m[i + 1] = 200; m[i + 2] = 255; m[i + 3] = 160;   // shown on the preview
+      }
+    }
+  }
+  const info = b => b.total && b.n / b.total >= TRACK_MIN_FRACTION
+    ? { x: b.sx / b.n / W - 0.5, frac: b.n / b.total } : null;
+  return { near: info(near), far: info(far), groundFrom: TRACK_GROUND_FROM };
+}
+
+function trackMessage({ near, far }) {
+  if (!near && !far) return null;
+  if (!near) {
+    if (far.x < -TRACK_CENTRE_TOL) return 'Track ahead on your left.';
+    if (far.x > TRACK_CENTRE_TOL) return 'Track ahead on your right.';
+    return 'Track ahead. Walk forward to reach it.';
+  }
+  if (near.x < -TRACK_CENTRE_TOL) return 'Track on your left, move left.';
+  if (near.x > TRACK_CENTRE_TOL) return 'Track on your right, move right.';
+  if (!far) return 'Track ends ahead.';
+  if (far.x - near.x < -TRACK_BEND_MIN) return 'Track bends left ahead.';
+  if (far.x - near.x > TRACK_BEND_MIN) return 'Track bends right ahead.';
+  return 'Go straight along the track.';
+}
+
+// Camera preview: yellow pixels highlighted, ground area and centre zone marked
+function drawTrackOverlay(frameW, frameH) {
+  if (overlayEl.width !== frameW || overlayEl.height !== frameH) {
+    overlayEl.width = frameW; overlayEl.height = frameH;
+  }
+  const g = overlayCtx;
+  g.clearRect(0, 0, frameW, frameH);
+  trackMaskCtx.putImageData(trackMask, 0, 0);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(trackMaskCanvas, 0, 0, frameW, frameH);
+  g.lineWidth = Math.max(2, Math.round(frameW / 200));
+  g.strokeStyle = '#FFD23F';
+  g.setLineDash([10, 8]);
+  const top = frameH * TRACK_GROUND_FROM;
+  g.beginPath();
+  g.moveTo(0, top); g.lineTo(frameW, top);
+  for (const s of [-TRACK_CENTRE_TOL, TRACK_CENTRE_TOL]) {
+    const x = (0.5 + s) * frameW;
+    g.moveTo(x, top); g.lineTo(x, frameH);
+  }
+  g.stroke();
+  g.setLineDash([]);
+}
+
+function describeBand(name, b) {
+  if (!b) return `${name}: no track`;
+  const where = b.x < -TRACK_CENTRE_TOL ? 'left' : b.x > TRACK_CENTRE_TOL ? 'right' : 'centre';
+  return `${name}: ${where} (${Math.round(b.frac * 100)}% yellow)`;
+}
+
+function trackTick() {
+  if (!trackActive || guardVideo.readyState < 2) return;
+  const frameW = guardVideo.videoWidth, frameH = guardVideo.videoHeight;
+  if (!frameW || !frameH) return;
+
+  const t = analyseTrack();
+  drawTrackOverlay(frameW, frameH);
+  detectionsEl.textContent = `${describeBand('Near', t.near)}\n${describeBand('Far', t.far)}`;
+
+  const msg = trackMessage(t);
+  if (msg === trackCandidate) trackCount++;
+  else { trackCandidate = msg; trackCount = 1; }
+  trackMissing = msg ? 0 : trackMissing + 1;
+
+  // Was following a track and it has gone for a while
+  if (trackOn && trackMissing >= TRACK_LOST_FRAMES) {
+    trackOn = false;
+    trackSaid = null;
+    speak('Track ended.', true);
+    return;
+  }
+  if (!msg || trackCount < TRACK_CONFIRM) return;
+
+  const now = Date.now();
+  if (msg === trackSaid && now - trackSaidAt < TRACK_REPEAT_MS) return;
+  speak(trackOn ? msg : `Track detected. ${msg}`, true);
+  trackOn = true;
+  trackSaid = msg;
+  trackSaidAt = now;
+}
+
+async function startTrack() {
+  hideLangChoice();
+  if (guardActive) stopGuard(false);
+  try {
+    speak('Starting track guide.', true);
+    trackStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    guardVideo.srcObject = trackStream;
+    previewEl.classList.add('visible');
+    await guardVideo.play();
+    trackActive = true;
+    resetTrackState();
+    keepScreenOn();
+    trackTimer = setInterval(trackTick, TRACK_INTERVAL_MS);
+    btnTrack.textContent = 'Follow track: On (tap to stop)';
+    btnTrack.classList.add('guard-on');
+    detectionsEl.style.whiteSpace = 'pre-line';
+    detectionsEl.classList.add('visible');
+    speak('Track guide is on. Point the camera at the ground ahead. Looking for the yellow track.', true);
+  } catch (e) {
+    speak('Could not start the camera for the track guide. Check camera permission.', true);
+    stopTrack(false);
+  }
+}
+
+function stopTrack(announce = true) {
+  trackActive = false;
+  if (trackTimer) { clearInterval(trackTimer); trackTimer = null; }
+  if (trackStream) { trackStream.getTracks().forEach(t => t.stop()); trackStream = null; }
+  resetTrackState();
+  releaseScreen();
+  detectionsEl.classList.remove('visible');
+  detectionsEl.style.whiteSpace = '';
+  detectionsEl.textContent = '';
+  btnTrack.textContent = 'Follow track';
+  btnTrack.classList.remove('guard-on');
+  previewEl.classList.remove('visible');
+  overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  if (announce) speak('Track guide stopped.', true);
+}
+
+btnTrack.addEventListener('click', () => {
+  if (trackActive) stopTrack(true); else startTrack();
+});
+</script>
+</body>
+</html>
